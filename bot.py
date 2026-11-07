@@ -20,10 +20,21 @@ import zstandard as zstd
 
 # ---------- Configuration ----------
 
-TOKEN = os.environ.get("BOT_TOKEN", "8758704422:AAGTexKCiwc1ASoolDYb39NFBTEgWMbo9ZM").strip()
+# توکن را از متغیر محیطی می‌خواند (BOT_TOKEN یا TOKEN).
+# اگر داخل کد هم گذاشته باشی، همان استفاده می‌شود.
+TOKEN = (
+    os.environ.get("BOT_TOKEN")
+    or os.environ.get("TOKEN")
+    or "8758704422:AAGTexKCiwc1ASoolDYb39NFBTEgWMbo9ZM"
+).strip()
 
-if not TOKEN or TOKEN.startswith("8758704422:AAGTexKCiwc1ASoolDYb39NFBTEgWMbo9ZM"):
-    raise SystemExit("BOT_TOKEN is required. Set it as environment variable or in the code.")
+# فقط وقتی هنوز placeholder است خطا می‌دهد
+if not TOKEN or TOKEN in ("توکن_واقعی_ربات_را_اینجا_قرار_بده", "YOUR_BOT_TOKEN") or TOKEN.startswith("توکن_"):
+    raise SystemExit(
+        "BOT_TOKEN is required.\n"
+        "Either set environment variable BOT_TOKEN (or TOKEN) in Railway,\n"
+        "or replace the placeholder string inside bot.py with your real token."
+    )
 
 # Optional: for Local Bot API Server (supports much larger files)
 # Example: BOT_API_BASE=http://localhost:8081
