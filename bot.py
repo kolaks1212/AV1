@@ -19,9 +19,11 @@ import requests
 
 # ---------- Configuration ----------
 
-TOKEN = os.environ.get("BOT_TOKEN", "").strip()
+TOKEN = "8758704422:AAGTexKCiwc1ASoolDYb39NFBTEgWMbo9ZM".strip()
+
 if not TOKEN:
-    raise SystemExit("BOT_TOKEN is required.")
+    raise SystemExit("Bot token is required.")
+
 
 DATA = Path(os.environ.get("DATA_DIR", "./data")).resolve()
 WORK = DATA / "work"
