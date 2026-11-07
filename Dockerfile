@@ -11,6 +11,9 @@ RUN apt-get update \
        ffmpeg \
        ca-certificates \
        tini \
+       liblzma5 \
+       libzstd1 \
+       libbrotli1 \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
@@ -22,6 +25,7 @@ COPY bot.py .
 
 RUN mkdir -p /data/work \
     && python -m py_compile bot.py \
+    && python -c "import zstandard, brotli, lzma; print('compression libs OK')" \
     && ffmpeg -hide_banner -encoders 2>/dev/null | grep -q libx264 \
     && ffmpeg -hide_banner -encoders 2>/dev/null | grep -q libx265 \
     && ffmpeg -hide_banner -encoders 2>/dev/null | grep -q libsvtav1
