@@ -1147,41 +1147,39 @@ def check_job(job_id):
 
 def download(job, target):
     info = api("getFile", {"file_id": job["file_id"]})
-    file_size = int(info.get("file_size", 0))
-    if file_size > DOWNLOAD_LIMIT:
+    if int(info.get("file_size", 0)) > DOWNLOAD_LIMIT:
         raise UserError("حجم فایل از سقف دانلود بیشتر است.")
 
     path = info.get("file_path")
     if not path:
         raise UserError("مسیر دانلود دریافت نشد.")
 
-    # ---------- حالت Local: کپی مستقیم از دیسک ----------
-    if path.startswith("/") and Path(path).is_file():
-        LOG.info("Local file copy: %s", path)
-        try:
-            shutil.copyfile(path, target)
-        except OSError as e:
-            raise UserError("کپی فایل لوکال ناموفق بود.") from e
-
-        size = target.stat().st_size
-        if size == 0:
-            raise UserError("فایل دانلودشده خالی است.")
-        if size > DOWNLOAD_LIMIT:
-            raise UserError("فایل از سقف دانلود بزرگ‌تر است.")
-        return size
-
-    # ---------- حالت عادی: دانلود از HTTP ----------
-    if path.startswith("/"):
-        work_dir = "/var/lib/telegram-bot-api/"
-        if path.startswith(work_dir):
-            path = path[len(work_dir):]
+    # --- شروع اصلاح مسیر فایل ---
+    if USE_LOCAL_API and path.startswith("/"):
+        # در حالت سرور محلی (--local)، تلگرام مسیر مطلق برمی‌گرداند. 
+        # مثال: /var/lib/telegram-bot-api/8758704422:.../videos/file_0.mp4
+        # ما باید فقط بخش نسبی (مثل videos/file_0.mp4) را جدا کنیم.
+        token_in_path = f"/{TOKEN}/"
+        if token_in_path in path:
+            relative_path = path.split(token_in_path, 1)[1]
         else:
-            path = path.lstrip("/")
+            # روش جایگزین: اگر ساختار مسیر متفاوت بود، دو بخش آخر را برمی‌داریم
+            relative_path = "/".join(path.strip("/").split("/")[-2:])
+    else:
+        # در حالت ابری، مسیر از قبل نسبی است
+        relative_path = path.lstrip("/")
+    # --- پایان اصلاح مسیر فایل ---
 
-    url = f"{API_BASE}/file/bot{TOKEN}/{path}"
     total = 0
+    download_url = f"{API_BASE}/file/bot{TOKEN}/{relative_path}"
+    
     try:
-        with requests.get(url, stream=True, timeout=(10, 120)) as response:
+        # افزایش تایم‌اوت (30 ثانیه اتصال، 300 ثانیه دریافت) برای فایل‌های بزرگ
+        with requests.get(
+            download_url,
+            stream=True,
+            timeout=(30, 300),
+        ) as response:
             response.raise_for_status()
             with target.open("wb") as output:
                 for chunk in response.iter_content(256 * 1024):
@@ -1192,12 +1190,15 @@ def download(job, target):
                     if total > DOWNLOAD_LIMIT:
                         raise UserError("فایل از سقف دانلود بزرگ‌تر است.")
                     output.write(chunk)
-    except requests.RequestException as e:
-        LOG.warning("Download failed: %s | url=%s", e, url)
-        raise UserError("دانلود فایل از Telegram ناموفق بود.") from None
+    except requests.RequestException as exc:
+        # ثبت لاگ دقیق برای عیب‌یابی (توکن برای امنیت ماسک شده است)
+        masked_url = download_url.replace(TOKEN, "[TOKEN]")
+        LOG.warning(f"Download failed for {job['id']}: {exc} - URL: {masked_url}")
+        raise UserError(f"دانلود فایل از Telegram ناموفق بود. ({type(exc).__name__})") from None
 
     if total == 0:
         raise UserError("فایل دانلودشده خالی است.")
+
     return total
     
 def probe(path):
