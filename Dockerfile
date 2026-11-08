@@ -1,45 +1,33 @@
-FROM python:3.12-slim-bookworm
+# پایه: ایمیج رسمی سرور Local API
+FROM aiogram/telegram-bot-api:latest
 
-ENV PYTHONUNBUFFERED=1 \
-    PYTHONDONTWRITEBYTECODE=1 \
-    PIP_NO_CACHE_DIR=1 \
-    DATA_DIR=/data \
-    PORT=8080 \
-    TELEGRAM_HTTP_PORT=8081
-
-# وابستگی‌های سیستم
-RUN apt-get update \
-    && apt-get install -y --no-install-recommends \
-       ffmpeg \
-       ca-certificates \
-       tini \
-       curl \
-       liblzma5 \
-       libzstd1 \
-       libbrotli1 \
-    && rm -rf /var/lib/apt/lists/*
-
-# دانلود باینری آماده telegram-bot-api
-# (نسخه لینوکس amd64)
-RUN curl -L -o /usr/local/bin/telegram-bot-api \
-      "https://github.com/tdlib/telegram-bot-api/releases/download/v7.9/telegram-bot-api-linux-x64" \
-    && chmod +x /usr/local/bin/telegram-bot-api \
-    || (echo "اگر لینک بالا کار نکرد، از روش دیگر استفاده کن" && exit 1)
+# نصب پایتون، pip، ffmpeg و supervisord
+RUN apk add --no-cache \
+    python3 \
+    py3-pip \
+    ffmpeg \
+    supervisor \
+    tini
 
 WORKDIR /app
 
+# نصب وابستگی‌های پایتون
 COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
+RUN pip3 install --no-cache-dir -r requirements.txt
 
+# کپی کد ربات و فایل‌های پیکربندی
 COPY bot.py .
-COPY entrypoint.sh .
-RUN chmod +x entrypoint.sh \
-    && mkdir -p /data/work /var/lib/telegram-bot-api \
-    && python -m py_compile bot.py
+COPY supervisord.conf /etc/supervisord.conf
+COPY entrypoint.sh /entrypoint.sh
+RUN chmod +x /entrypoint.sh
 
-EXPOSE 8080
+# مسیر پیش‌فرض برای ذخیره‌سازی فایل‌های سرور API (قابل بازنویسی با Volume)
+ENV TELEGRAM_WORK_DIR="/var/lib/telegram-bot-api"
+ENV TELEGRAM_TEMP_DIR="/tmp/telegram-bot-api"
+RUN mkdir -p "$TELEGRAM_WORK_DIR" "$TELEGRAM_TEMP_DIR"
 
-STOPSIGNAL SIGTERM
+# اعلام پورت‌ها (8080 برای healthcheck ربات، 8081 برای سرور API)
+EXPOSE 8080 8081
 
-ENTRYPOINT ["/usr/bin/tini", "--"]
-CMD ["./entrypoint.sh"]
+# اجرای entrypoint به عنوان PID 1
+ENTRYPOINT ["/sbin/tini", "--", "/entrypoint.sh"]
