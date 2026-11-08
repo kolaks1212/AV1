@@ -1154,18 +1154,24 @@ def download(job, target):
     if not path:
         raise UserError("مسیر دانلود دریافت نشد.")
 
-    # در حالت local مسیر مطلق برمی‌گردد (شروع با /)
+    # در حالت local مسیر مطلق برمی‌گردد. باید به مسیر نسبی تبدیل شود.
     if path.startswith("/"):
-        url = f"{API_BASE}/file/bot{TOKEN}{path}"
-    else:
-        url = f"{API_BASE}/file/bot{TOKEN}/{path}"
+        # ساختار معمول: /var/lib/telegram-bot-api/TOKEN/videos/file_0.mp4
+        marker = f"/{TOKEN}/"
+        if marker in path:
+            path = path.split(marker, 1)[1]
+        else:
+            # fallback
+            path = path.lstrip("/")
+
+    url = f"{API_BASE}/file/bot{TOKEN}/{path}"
 
     total = 0
     try:
         with requests.get(
             url,
             stream=True,
-            timeout=(10, 60),
+            timeout=(10, 120),
         ) as response:
             response.raise_for_status()
             with target.open("wb") as output:
@@ -1185,7 +1191,6 @@ def download(job, target):
         raise UserError("فایل دانلودشده خالی است.")
 
     return total
-
 
 def probe(path):
     try:
