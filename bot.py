@@ -1154,23 +1154,12 @@ def download(job, target):
     if not path:
         raise UserError("مسیر دانلود دریافت نشد.")
 
-    # اگر Local API باشه و مسیر مطلق برگردونده باشه
-    if path.startswith("/"):
-        source_path = Path(path)
-        if not source_path.exists():
-            raise UserError("فایل روی سرور Local API پیدا نشد.")
-        
-        # کپی مستقیم از دیسک (خیلی سریع‌تر)
-        shutil.copy2(source_path, target)
-        return source_path.stat().st_size
-
-    # حالت عادی (API ابری یا مسیر نسبی)
     total = 0
     try:
         with requests.get(
             f"{API_BASE}/file/bot{TOKEN}/{path}",
             stream=True,
-            timeout=(10, 60),
+            timeout=(10, 30),
         ) as response:
             response.raise_for_status()
             with target.open("wb") as output:
@@ -1189,6 +1178,7 @@ def download(job, target):
         raise UserError("فایل دانلودشده خالی است.")
 
     return total
+
 
 def probe(path):
     try:
