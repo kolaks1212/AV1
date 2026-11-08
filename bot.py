@@ -1154,12 +1154,18 @@ def download(job, target):
     if not path:
         raise UserError("مسیر دانلود دریافت نشد.")
 
+    # در حالت local مسیر مطلق برمی‌گردد (شروع با /)
+    if path.startswith("/"):
+        url = f"{API_BASE}/file/bot{TOKEN}{path}"
+    else:
+        url = f"{API_BASE}/file/bot{TOKEN}/{path}"
+
     total = 0
     try:
         with requests.get(
-            f"{API_BASE}/file/bot{TOKEN}/{path}",
+            url,
             stream=True,
-            timeout=(10, 30),
+            timeout=(10, 60),
         ) as response:
             response.raise_for_status()
             with target.open("wb") as output:
@@ -1171,7 +1177,8 @@ def download(job, target):
                     if total > DOWNLOAD_LIMIT:
                         raise UserError("فایل از سقف دانلود بزرگ‌تر است.")
                     output.write(chunk)
-    except requests.RequestException:
+    except requests.RequestException as e:
+        LOG.warning("Download failed: %s | url=%s", e, url)
         raise UserError("دانلود فایل از Telegram ناموفق بود.") from None
 
     if total == 0:
