@@ -1154,26 +1154,16 @@ def download(job, target):
     if not path:
         raise UserError("مسیر دانلود دریافت نشد.")
 
-    # در حالت local مسیر مطلق برمی‌گردد. باید به مسیر نسبی تبدیل شود.
-    if path.startswith("/"):
-        # تبدیل مسیر مطلق به مسیر نسبی قابل استفاده در HTTP
-        # مثال:
-        # /var/lib/telegram-bot-api/TOKEN/videos/file_0.mp4
-        #  →  TOKEN/videos/file_0.mp4
-        work_dir = "/var/lib/telegram-bot-api/"
-        if path.startswith(work_dir):
-            path = path[len(work_dir):]
-        else:
-            path = path.lstrip("/")
-
-    url = f"{API_BASE}/file/bot{TOKEN}/{path}"
+    # اصلاح: حذف اسلش اضافی از ابتدای مسیر (مخصوص حالت Local)
+    path = path.lstrip("/")
 
     total = 0
     try:
+        # اصلاح: افزایش زمان تایم‌اوت برای فایل‌های بزرگ‌تر
         with requests.get(
-            url,
+            f"{API_BASE}/file/bot{TOKEN}/{path}",
             stream=True,
-            timeout=(10, 120),
+            timeout=(30, 300), # ۳۰ ثانیه برای اتصال، ۳۰۰ ثانیه برای دریافت
         ) as response:
             response.raise_for_status()
             with target.open("wb") as output:
@@ -1185,15 +1175,15 @@ def download(job, target):
                     if total > DOWNLOAD_LIMIT:
                         raise UserError("فایل از سقف دانلود بزرگ‌تر است.")
                     output.write(chunk)
-    except requests.RequestException as e:
-        LOG.warning("Download failed: %s | url=%s", e, url)
-        raise UserError("دانلود فایل از Telegram ناموفق بود.") from None
+    except requests.RequestException as exc:
+        # اصلاح: چاپ خطای دقیق در کنسول برای دیباگ کردن
+        LOG.warning(f"Download failed for {job['id']}: {exc}")
+        raise UserError(f"دانلود فایل از Telegram ناموفق بود. ({type(exc).__name__})") from None
 
     if total == 0:
         raise UserError("فایل دانلودشده خالی است.")
 
     return total
-
 def probe(path):
     try:
         result = subprocess.run(
