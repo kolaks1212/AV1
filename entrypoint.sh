@@ -1,35 +1,12 @@
-#!/bin/bash
+#!/bin/sh
 set -e
 
-# پوشه‌های لازم
-mkdir -p /var/lib/telegram-bot-api /tmp/telegram-bot-api /data/work
+# اگر Volume متصل باشد، مسیر آن را از Railway می‌خوانیم
+if [ -n "$RAILWAY_VOLUME_MOUNT_PATH" ]; then
+    export TELEGRAM_WORK_DIR="$RAILWAY_VOLUME_MOUNT_PATH/telegram-bot-api"
+    mkdir -p "$TELEGRAM_WORK_DIR"
+    echo "Volume detected. Using TELEGRAM_WORK_DIR=$TELEGRAM_WORK_DIR"
+fi
 
-# پورت سرور لوکال
-API_PORT="${TELEGRAM_HTTP_PORT:-8081}"
-
-# استارت سرور لوکال در پس‌زمینه
-echo "Starting telegram-bot-api on port $API_PORT ..."
-telegram-bot-api \
-  --api-id="$TELEGRAM_API_ID" \
-  --api-hash="$TELEGRAM_API_HASH" \
-  --local \
-  --http-port="$API_PORT" \
-  --dir=/var/lib/telegram-bot-api \
-  --temp-dir=/tmp/telegram-bot-api \
-  --verbosity=1 &
-
-# صبر کن تا سرور آماده شود
-for i in $(seq 1 30); do
-  if curl -sf "http://127.0.0.1:${API_PORT}/" >/dev/null 2>&1; then
-    echo "telegram-bot-api is ready."
-    break
-  fi
-  sleep 1
-done
-
-# آدرس داخلی برای ربات
-export TELEGRAM_API_BASE="http://127.0.0.1:${API_PORT}"
-
-# استارت ربات
-echo "Starting bot..."
-exec python bot.py
+# اجرای supervisord به عنوان فرآیند foreground
+exec /usr/bin/supervisord -c /etc/supervisord.conf
