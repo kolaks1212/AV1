@@ -1150,20 +1150,35 @@ def download(job, target):
     if int(info.get("file_size", 0)) > DOWNLOAD_LIMIT:
         raise UserError("حجم فایل از سقف دانلود بیشتر است.")
 
-    path = info.get("file_path")
-    if not path:
-        raise UserError("مسیر دانلود دریافت نشد.")
+    file_path = info.get("file_path")
+    if not file_path:
+        raise UserError("مسیر دانلود فایل دریافت نشد.")
 
-    # اصلاح: حذف اسلش اضافی از ابتدای مسیر (مخصوص حالت Local)
-    path = path.lstrip("/")
+    # --- شروع اصلاح کلیدی ---
+    # در حالت --local، مسیر برگشتی مطلق است (مثلاً /var/lib/telegram-bot-api/.../videos/file_0.mp4)
+    # باید بخش /var/lib/telegram-bot-api/{TOKEN}/ را حذف کنیم تا مسیر نسبی (videos/file_0.mp4) به دست آید.
+    if USE_LOCAL_API:
+        # حذف پیشوند مسیر مطلق سرور محلی
+        prefix = f"/var/lib/telegram-bot-api/{TOKEN}/"
+        if file_path.startswith(prefix):
+            relative_path = file_path[len(prefix):]
+        else:
+            # اگر ساختار متفاوت بود، از یک روش جایگزین استفاده می‌کنیم
+            # (مثلاً پیدا کردن آخرین بخش‌های مسیر)
+            relative_path = "/".join(file_path.split("/")[-2:])
+    else:
+        # در حالت ابری، مسیر از قبل نسبی است
+        relative_path = file_path
+    # --- پایان اصلاح کلیدی ---
 
     total = 0
     try:
-        # اصلاح: افزایش زمان تایم‌اوت برای فایل‌های بزرگ‌تر
+        # استفاده از مسیر نسبی اصلاح‌شده برای ساخت آدرس دانلود
+        download_url = f"{API_BASE}/file/bot{TOKEN}/{relative_path}"
         with requests.get(
-            f"{API_BASE}/file/bot{TOKEN}/{path}",
+            download_url,
             stream=True,
-            timeout=(30, 300), # ۳۰ ثانیه برای اتصال، ۳۰۰ ثانیه برای دریافت
+            timeout=(30, 300), # تایم‌اوت افزایش یافته
         ) as response:
             response.raise_for_status()
             with target.open("wb") as output:
@@ -1176,7 +1191,6 @@ def download(job, target):
                         raise UserError("فایل از سقف دانلود بزرگ‌تر است.")
                     output.write(chunk)
     except requests.RequestException as exc:
-        # اصلاح: چاپ خطای دقیق در کنسول برای دیباگ کردن
         LOG.warning(f"Download failed for {job['id']}: {exc}")
         raise UserError(f"دانلود فایل از Telegram ناموفق بود. ({type(exc).__name__})") from None
 
@@ -1184,6 +1198,7 @@ def download(job, target):
         raise UserError("فایل دانلودشده خالی است.")
 
     return total
+    
 def probe(path):
     try:
         result = subprocess.run(
