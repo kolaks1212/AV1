@@ -27,17 +27,17 @@ except ImportError as exc:
 # ---------- Configuration ----------
 
 TOKEN = os.environ.get("BOT_TOKEN", "8758704422:AAGTexKCiwc1ASoolDYb39NFBTEgWMbo9ZM").strip()
-
+API_BASE = "http://127.0.0.1:8081"
 API_ID = os.environ.get("TELEGRAM_API_ID", "").strip()
 API_HASH = os.environ.get("TELEGRAM_API_HASH", "").strip()
-API_BASE = os.environ.get("TELEGRAM_API_BASE", "https://api.telegram.org").rstrip("/")
+
 
 if not TOKEN:
     raise SystemExit("Bot token is required.")
 
-USE_LOCAL_API = API_BASE != "https://api.telegram.org"
-DOWNLOAD_LIMIT = 1_900_000_000 if USE_LOCAL_API else 19_000_000
-UPLOAD_LIMIT = 1_900_000_000 if USE_LOCAL_API else 49_000_000
+USE_LOCAL_API = True
+DOWNLOAD_LIMIT = 1_900_000_000
+UPLOAD_LIMIT = 1_900_000_000
 
 DATA = Path(os.environ.get("DATA_DIR", "./data")).resolve()
 WORK = DATA / "work"
