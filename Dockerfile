@@ -13,7 +13,7 @@ WORKDIR /app
 
 # نصب وابستگی‌های پایتون
 COPY requirements.txt .
-RUN pip3 install --no-cache-dir -r requirements.txt
+RUN pip3 install --no-cache-dir --break-system-packages -r requirements.txt
 
 # کپی کد ربات و فایل‌های پیکربندی
 COPY bot.py .
