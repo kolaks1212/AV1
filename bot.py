@@ -1156,12 +1156,14 @@ def download(job, target):
 
     # در حالت local مسیر مطلق برمی‌گردد. باید به مسیر نسبی تبدیل شود.
     if path.startswith("/"):
-        # ساختار معمول: /var/lib/telegram-bot-api/TOKEN/videos/file_0.mp4
-        marker = f"/{TOKEN}/"
-        if marker in path:
-            path = path.split(marker, 1)[1]
+        # تبدیل مسیر مطلق به مسیر نسبی قابل استفاده در HTTP
+        # مثال:
+        # /var/lib/telegram-bot-api/TOKEN/videos/file_0.mp4
+        #  →  TOKEN/videos/file_0.mp4
+        work_dir = "/var/lib/telegram-bot-api/"
+        if path.startswith(work_dir):
+            path = path[len(work_dir):]
         else:
-            # fallback
             path = path.lstrip("/")
 
     url = f"{API_BASE}/file/bot{TOKEN}/{path}"
