@@ -257,10 +257,13 @@ CREATE INDEX IF NOT EXISTS presets_uid_kind
 ON presets(uid, kind);
 """)
 
-# Migration: add 'kind' if the DB is older
+# Migration: add 'kind' and 'server_path' if the DB is older
 cols = [row[1] for row in DB.execute("PRAGMA table_info(jobs)").fetchall()]
 if "kind" not in cols:
     DB.execute("ALTER TABLE jobs ADD COLUMN kind TEXT NOT NULL DEFAULT 'video'")
+    DB.commit()
+if "server_path" not in cols:
+    DB.execute("ALTER TABLE jobs ADD COLUMN server_path TEXT DEFAULT NULL")
     DB.commit()
 
 DB.commit()
@@ -1048,6 +1051,37 @@ def handle_callback(callback):
             answer(callback["id"], "لغو ثبت شد." if changed else "امکان‌پذیر نیست.")
             if changed:
                 edit(chat, mid, f'⛔ کار {job["id"]} لغو شد.')
+    elif parts[0] == "del_file" and len(parts) == 2:
+        job = job_by_id(parts[1])
+        if not job or job["uid"] != uid:
+            answer(callback["id"], "کار یافت نشد یا دسترسی ندارید.")
+            return
+
+        server_path = job.get("server_path")
+        if server_path:
+            try:
+                p = Path(server_path)
+                if p.exists() and p.is_file():
+                    p.unlink()
+                execute("UPDATE jobs SET server_path=NULL WHERE id=?", (job["id"],))
+                answer(callback["id"], "✅ فایل اصلی با موفقیت از سرور حذف شد.")
+                edit(
+                    chat, mid,
+                    f'✅ کار {job["id"]} ارسال شد.\n\n'
+                    "🗑 فایل اصلی از سرور پاک شد و فضای Volume آزاد گردید.",
+                    keyboard([])
+                )
+            except Exception as exc:
+                LOG.error(f"Failed to delete {server_path}: {exc}")
+                answer(callback["id"], "خطا در حذف فایل رخ داد.")
+        else:
+            answer(callback["id"], "فایل اصلی قبلاً حذف شده یا موجود نیست.")
+            edit(
+                chat, mid,
+                f'✅ کار {job["id"]} ارسال شد.\n\n'
+                "🗑 فایل اصلی از سرور پاک شده بود.",
+                keyboard([])
+            )
     else:
         answer(callback["id"])
 
@@ -1145,9 +1179,6 @@ def check_job(job_id):
         raise Cancelled()
 
 
-import shutil
-from pathlib import Path
-
 def download(job, target):
     info = api("getFile", {"file_id": job["file_id"]})
     if int(info.get("file_size", 0)) > DOWNLOAD_LIMIT:
@@ -1156,6 +1187,9 @@ def download(job, target):
     file_path = info.get("file_path")
     if not file_path:
         raise UserError("مسیر دانلود دریافت نشد.")
+
+    # ذخیره مسیر روی سرور برای قابلیت حذف با اجازه کاربر
+    execute("UPDATE jobs SET server_path=? WHERE id=?", (file_path, job["id"]))
 
     total = 0
 
@@ -1210,6 +1244,7 @@ def download(job, target):
 
     return total
     
+
 def probe(path):
     try:
         result = subprocess.run(
@@ -1709,10 +1744,18 @@ def process_job(job):
         upload_result(job, target, settings, output_info, caption, kind)
 
         execute("UPDATE jobs SET status='done' WHERE id=?", (job_id,))
+        
+        # اضافه کردن دکمه حذف فایل اصلی
+        del_buttons = []
+        if USE_LOCAL_API:
+            del_buttons = [[button("🗑 حذف فایل اصلی از سرور", f"del_file:{job_id}")]]
+            
         edit(
             job["chat"], job["message"],
             f'✅ کار {job_id} ارسال شد.\n'
-            f"زمان کل: {time.monotonic() - started:.1f} ثانیه",
+            f"زمان کل: {time.monotonic() - started:.1f} ثانیه\n\n"
+            "شما می‌توانید برای آزادسازی فضای سرور، فایل اصلی را حذف کنید.",
+            keyboard(del_buttons)
         )
 
     except Cancelled:
