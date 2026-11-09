@@ -8,12 +8,12 @@ import shutil
 import signal
 import sqlite3
 import subprocess
-import tarfile
 import threading
 import time
 import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from urllib.parse import urlparse
 
 import requests
 
@@ -53,7 +53,9 @@ STOP = threading.Event()
 DB_LOCK = threading.RLock()
 DOWNLOAD_SEM = threading.Semaphore(MAX_CONCURRENT_DOWNLOADS)
 SESSION = {}
-COLLECT = {}
+
+VIDEO_URL_EXTS = (".mp4", ".mkv", ".mov", ".webm", ".avi", ".m4v", ".ts",
+                  ".flv", ".wmv", ".m3u8", ".mpeg", ".mpg", ".3gp", ".ogv")
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 LOG = logging.getLogger("compressor")
@@ -121,6 +123,40 @@ CHOICES = {
     "file_threads": [("خودکار", 0), ("1", 1), ("2", 2), ("4", 4), ("8", 8)],
 }
 
+# پریست‌های آماده‌ی سیستمی (قابل حذف نیستند، فقط اعمال)
+SYSTEM_PRESETS = {
+    "slides": {
+        "title": "📊 اسلاید و صفحه (متن خوانا)",
+        "kind": "video",
+        "desc": "برای صفحه‌نمایش، اسلاید، آموزش و Screencast — حفظ وضوح متن و لبه‌ها",
+        "settings": {
+            "codec": "h264", "quality": "quality", "height": 1080, "fps": 30,
+            "audio": 96, "delivery": "document", "strip_metadata": True,
+            "keep_subs": False, "hdr_to_sdr": True, "target_mb": 0,
+        },
+    },
+    "action": {
+        "title": "🎬 فیلم و محتوای پرتحرک",
+        "kind": "video",
+        "desc": "برای فیلم، ورزش و صحنه‌های سریع — حفظ جزئیات حرکات با H.265",
+        "settings": {
+            "codec": "hevc", "quality": "quality", "height": 0, "fps": 0,
+            "audio": 128, "delivery": "document", "strip_metadata": True,
+            "keep_subs": False, "hdr_to_sdr": True, "target_mb": 0,
+        },
+    },
+    "weak": {
+        "title": "📶 اینترنت ضعیف (حجم کم)",
+        "kind": "video",
+        "desc": "برای ارسال سریع با کمترین حجم — 480p، H.264، صدای 64",
+        "settings": {
+            "codec": "h264", "quality": "small", "height": 480, "fps": 24,
+            "audio": 64, "delivery": "document", "strip_metadata": True,
+            "keep_subs": False, "hdr_to_sdr": True, "target_mb": 0,
+        },
+    },
+}
+
 INFO_TEXTS = {
     "codec": (
         "<b>کدک ویدیو</b>\n\n"
@@ -178,14 +214,15 @@ INFO_TEXTS = {
     ),
     "preview_only": (
         "<b>نمونه ۱۰ ثانیه‌ای</b>\n\n"
-        "فقط ۱۰ ثانیه از وسط ویدیو با تنظیمات فعلی فشرده می‌شود تا کیفیت را قبل از پردازش کامل ببینید.\n"
-        "پس از تأیید، کل ویدیو فشرده می‌شود."
+        "فقط ۱۰ ثانیه از ویدیو با تنظیمات فعلی فشرده می‌شود تا کیفیت را قبل از پردازش کامل ببینید.\n"
+        "اگر بازه زمانی تنظیم شده باشد، از ابتدای همان بازه نمونه ساخته می‌شود."
     ),
     "file_codec": (
         "<b>الگوریتم فشرده‌سازی</b>\n\n"
         "• <b>Zstandard</b>: بسیار سریع، نسبت خوب. بهترین برای اکثر فایل‌ها.\n"
         "• <b>Brotli</b>: نسبت بهتر برای متن، HTML و CSS. کمی کندتر.\n"
-        "• <b>LZMA2 (XZ)</b>: بالاترین نسبت فشرده‌سازی، اما کندترین. مناسب آرشیو بلندمدت."
+        "• <b>LZMA2 (XZ)</b>: بالاترین نسبت فشرده‌سازی، اما کندترین. مناسب آرشیو بلندمدت.\n\n"
+        "<i>راهنمای باز کردن فایل‌های فشرده در پایین بخش «راهنما» موجود است.</i>"
     ),
     "file_level": (
         "<b>سطح فشرده‌سازی</b>\n\n"
@@ -219,6 +256,7 @@ def escape_html(text):
 
 def human_size(size):
     if size is None: return "—"
+    if size <= 0: return "در حال تعیین..."
     if size < 1024: return f"{int(size)} بایت"
     if size < 1024**2: return f"{size/1024:.1f} KB"
     if size < 1024**3: return f"{size/1024**2:.1f} MB"
@@ -268,13 +306,8 @@ def parse_time_part(s):
 def parse_clip_range(text):
     text = (text or "").strip()
     text = re.sub(r"\b(ثانیه|ثانیه‌ای|دقیقه|دقیقه‌ای|ساعت)\b", "", text).strip()
-    # "start-end" form
-    if "-" in text and not text.startswith("-") and ":" not in text.split("-")[0].replace(":", ""):
-        pass
     if "-" in text and not text.startswith("-"):
-        # ambiguity with negative numbers is handled by earlier check
         left, _, right = text.partition("-")
-        # Only treat as range if neither side contains a space that would suggest "start dur"
         if left.strip() and right.strip():
             start = parse_time_part(left)
             end = parse_time_part(right)
@@ -289,6 +322,50 @@ def parse_clip_range(text):
     if dur <= 0:
         raise ValueError("مدت باید مثبت باشد")
     return start, dur
+
+
+def is_url(text):
+    if not text: return False
+    text = text.strip()
+    if not (text.startswith("http://") or text.startswith("https://")): return False
+    if re.search(r"\s", text): return False
+    return True
+
+
+def url_to_name(url):
+    try:
+        path = urlparse(url).path
+        name = Path(path).name
+        if name and len(name) >= 2:
+            return clean_name(name)
+    except Exception: pass
+    return "download"
+
+
+def detect_url_kind(url):
+    """Returns (kind, size). kind in ('video', 'file')."""
+    try:
+        path = urlparse(url).path.lower()
+        guessed_kind = "video" if path.endswith(VIDEO_URL_EXTS) else None
+    except Exception:
+        guessed_kind = None
+    try:
+        r = requests.head(url, allow_redirects=True, timeout=10,
+                          headers={"User-Agent": "Mozilla/5.0"})
+        ct = r.headers.get("Content-Type", "").lower()
+        try:
+            size = int(r.headers.get("Content-Length", 0))
+        except (TypeError, ValueError):
+            size = 0
+        if size > DOWNLOAD_LIMIT:
+            raise UserError(f"حجم فایل از سقف ({human_size(DOWNLOAD_LIMIT)}) بیشتر است.")
+        if guessed_kind == "video" or ct.startswith("video/"):
+            return "video", size
+        return "file", size
+    except UserError:
+        raise
+    except Exception:
+        return guessed_kind or "file", 0
 
 
 class UploadProgress:
@@ -352,6 +429,7 @@ for c, d in [
     ("finished_at", "REAL DEFAULT NULL"),
     ("media_info", "TEXT DEFAULT NULL"),
     ("error_msg", "TEXT DEFAULT NULL"),
+    ("source_url", "TEXT DEFAULT NULL"),
 ]:
     if c not in cols:
         DB.execute(f"ALTER TABLE jobs ADD COLUMN {c} {d}")
@@ -408,7 +486,6 @@ def authorized(uid, claim=False):
     return True
 
 def job_by_id(jid): return one("SELECT * FROM jobs WHERE id=?", (jid,))
-
 
 def ensure_default_presets(uid):
     if not list_presets(uid, "video"):
@@ -512,7 +589,7 @@ def home(chat, message_id=None):
     text = (
         "🎬 <b>فشرده‌ساز چندمنظوره</b>\n\n"
         "ویدیو یا فایل خود را بفرستید تا بهینه‌سازی شود.\n"
-        "می‌توانید چند فایل را پشت‌سرهم ارسال کنید.\n\n"
+        "می‌توانید <b>چند فایل پشت‌سرهم</b> بفرستید یا <b>لینک دانلود مستقیم</b> بفرستید.\n\n"
         "━━━━━━━━━━━━━━━\n"
         f'📥 سقف حجم ورودی: <b>{human_size(DOWNLOAD_LIMIT)}</b>\n'
         f'⏱ حداکثر مدت ویدیو: <b>{human_time(MAX_SECONDS)}</b>\n'
@@ -521,12 +598,13 @@ def home(chat, message_id=None):
         "• ⚙️ <b>تنظیمات ویدیو</b> — کدک، کیفیت، رزولوشن\n"
         "• 📦 <b>تنظیمات فایل</b> — الگوریتم، سطح فشرده‌سازی\n"
         "• 💾 <b>پریست‌های من</b> — ذخیره و بارگذاری تنظیمات\n"
+        "• 📚 <b>مجموعه من</b> — فایل‌های در انتظار پردازش\n"
         "• 📋 <b>صف کارها</b> — وضعیت کارهای در حال انجام\n"
         "• 📊 <b>آمار ربات</b> — گزارش مصرف و عملکرد"
     )
     markup = keyboard([
         [button("⚙️ تنظیمات ویدیو", "menu:settings"), button("📦 تنظیمات فایل", "menu:file_settings")],
-        [button("💾 پریست‌های من", "menu:presets")],
+        [button("💾 پریست‌های من", "menu:presets"), button("📚 مجموعه من", "menu:batch")],
         [button("📋 صف کارها", "menu:queue"), button("📊 آمار ربات", "menu:stats")],
         [button("❓ راهنما", "menu:help")],
     ])
@@ -569,7 +647,6 @@ def file_settings_menu(chat, uid, mid=None):
         [button("🗜 الگوریتم", "pick:file_codec"), button("🎚 سطح فشرده‌سازی", "pick:file_level")],
         [button("⚙️ تعداد رشته‌ها", "pick:file_threads")],
         [button("💾 ذخیره به‌عنوان پریست", "preset:save:file"), button("📂 پریست‌های من", "menu:presets")],
-        [button("📦 حالت جمع‌آوری", "menu:collect")],
         [button("♻️ بازنشانی به پیش‌فرض", "reset:file"), button("🔙 بازگشت", "menu:home")],
     ])
     if mid: edit(chat, mid, text, markup)
@@ -580,6 +657,13 @@ def show_presets(chat, uid, mid=None):
     ensure_default_presets(uid)
     parts = ["💾 <b>پریست‌های من</b>", "<i>تنظیمات ذخیره‌شده برای بارگذاری سریع.</i>"]
     buttons = []
+
+    # Ready/system presets
+    parts.append("\n<b>⭐ پریست‌های آماده:</b>")
+    for key, sp in SYSTEM_PRESETS.items():
+        parts.append(f'• <b>{sp["title"]}</b>\n  <i>{sp["desc"]}</i>')
+        buttons.append([button(f'⭐ اعمال: {sp["title"]}', f'preset:loadsys:{key}')])
+
     for kind, title in (("video", "🎥 ویدیو"), ("file", "📦 فایل")):
         rows = list_presets(uid, kind)
         parts.append(f"\n<b>{title}:</b>")
@@ -610,14 +694,49 @@ def show_queue(chat, uid):
         k = "🎥" if r.get("kind") == "video" else "📦"
         icon = icons.get(r["status"], "•")
         lines.append(f'{icon} {k} <code>{r["id"]}</code> — {labels.get(r["status"], r["status"])}\n   {escape_html(r["name"])}')
-        if r["status"] in ("awaiting", "done", "failed", "cancelled"):
-            if r["status"] == "awaiting":
-                buttons.append([button(f'▶️ شروع {r["id"]}', f'go:{r["id"]}'), button(f'❌ لغو {r["id"]}', f'cancel:{r["id"]}')])
-            else:
-                buttons.append([button(f'🔄 مجدد {r["id"]}', f'go:{r["id"]}')])
+        if r["status"] == "awaiting":
+            buttons.append([button(f'▶️ شروع {r["id"]}', f'go:{r["id"]}'), button(f'❌ لغو {r["id"]}', f'cancel:{r["id"]}')])
         elif r["status"] in ("queued", "running", "downloading"):
             buttons.append([button(f'❌ لغو {r["id"]}', f'cancel:{r["id"]}')])
+        # No re-process button for done/failed/cancelled (per request)
     send(chat, "\n\n".join(lines), keyboard(buttons))
+
+
+def show_batch(chat, uid, mid=None):
+    """مجموعه‌ی خودکار فایل‌های در انتظار (جایگزین حالت جمع‌آوری قبلی)."""
+    jobs = many(
+        "SELECT * FROM jobs WHERE uid=? AND status IN ('downloading','awaiting','queued') "
+        "ORDER BY created DESC LIMIT 40", (uid,)
+    )
+    if not jobs:
+        text = (
+            "📚 <b>مجموعه شما خالی است</b>\n\n"
+            "هر ویدیو، فایل یا لینکی که بفرستید به‌طور خودکار اینجا ثبت می‌شود.\n"
+            "می‌توانید تنظیمات را روی همه اعمال کنید یا هرکدام را جدا تنظیم کنید."
+        )
+        markup = keyboard([[button("🔙 بازگشت", "menu:home")]])
+        if mid: edit(chat, mid, text, markup)
+        else: send(chat, text, markup)
+        return
+    awaiting_ids = [r["id"] for r in jobs if r["status"] == "awaiting"]
+    lines = [f"📚 <b>مجموعه شما ({len(jobs)} فایل)</b>", ""]
+    for r in jobs:
+        icon = {"downloading": "📥", "awaiting": "⏳", "queued": "📋"}.get(r["status"], "•")
+        k = "🎥" if r.get("kind") == "video" else "📦"
+        src = "🔗 " if r.get("source_url") else ""
+        lines.append(f'{icon} {k} {src}<code>{r["id"]}</code> — {escape_html(r["name"])}')
+        lines.append(f'   💾 {human_size(r["size"])}')
+    lines.append("")
+    lines.append("<i>هر فایل پیام جداگانه‌ای برای تنظیم دقیق دارد؛ برای تنظیم گروهی از دکمه‌های زیر استفاده کنید.</i>")
+
+    buttons = []
+    if awaiting_ids:
+        buttons.append([button(f"📂 اعمال پریست به همه ({len(awaiting_ids)})", "batch:preset")])
+        buttons.append([button(f"▶️ شروع همه ({len(awaiting_ids)})", "batch:start")])
+        buttons.append([button(f"🗑 لغو همه ({len(awaiting_ids)})", "batch:cancel")])
+    buttons.append([button("🔙 بازگشت", "menu:home")])
+    if mid: edit(chat, mid, "\n".join(lines), keyboard(buttons))
+    else: send(chat, "\n".join(lines), keyboard(buttons))
 
 
 def clear_volume_files(chat):
@@ -650,7 +769,7 @@ def clear_volume_files(chat):
                 f.unlink()
                 deleted += 1
             except Exception: pass
-    # Clean work dirs for terminal jobs (keep active ones intact)
+    # Keep work dirs of active jobs; remove terminal ones
     active_states = ("downloading", "awaiting", "queued", "running")
     active_ids = {r["id"] for r in many(
         "SELECT id FROM jobs WHERE status IN (?,?,?,?)", active_states)}
@@ -715,25 +834,58 @@ def help_text():
         "❓ <b>راهنمای کامل</b>\n\n"
         "🎥 <b>فشرده‌سازی ویدیو</b>\n"
         "1. تنظیمات را از منوی «تنظیمات ویدیو» انتخاب کنید\n"
-        "2. ویدیو یا فایل ویدیویی بفرستید\n"
+        "2. ویدیو، فایل ویدیویی یا لینک دانلود مستقیم بفرستید\n"
         "3. در کادر بازشده می‌توانید:\n"
-        "   • ✂️ روی «بازه زمانی» بزنید تا فقط بخشی از ویدیو فشرده شود\n"
-        "   • 🧪 روی «نمونه ۱۰ ثانیه‌ای» بزنید تا کیفیت واقعی را ببینید\n"
-        "   • 📂 پریست ذخیره‌شده را اعمال کنید\n"
+        "   • ✂️ «بازه زمانی» — فقط بخشی از ویدیو را فشرده کنید\n"
+        "   • 🧪 «نمونه ۱۰ ثانیه‌ای» — کیفیت واقعی را ببینید\n"
+        "   • 🎵 «استخراج صدا» — فقط صدای ویدیو را دریافت کنید\n"
+        "   • 📂 پریست ذخیره‌شده یا آماده را اعمال کنید\n"
         "   • سپس ✅ «شروع» بزنید\n\n"
         "📦 <b>فشرده‌سازی فایل</b>\n"
         "1. الگوریتم و سطح را در تنظیمات فایل انتخاب کنید\n"
         "2. فایل را بفرستید\n"
         "3. خروجی فشرده با پسوند مناسب دریافت می‌شود\n\n"
+        "🔗 <b>لینک دانلود مستقیم</b>\n"
+        "هر لینکی که با <code>http://</code> یا <code>https://</code> شروع شود به‌طور خودکار پذیرفته می‌شود.\n"
+        "نوع فایل (ویدیو یا سند) از پسوند یا Content-Type تشخیص داده می‌شود.\n\n"
+        "📚 <b>مجموعه خودکار</b>\n"
+        "هر فایل/لینکی که بفرستید به‌طور خودکار در «مجموعه من» ثبت می‌شود.\n"
+        "می‌توانید تنظیمات را روی همه اعمال کنید یا هر فایل را جدا تنظیم کنید.\n"
+        "تشخیص فایل تکراری فعال است — ارسال مجدد فایل مشابه مسدود می‌شود.\n\n"
         "⚡ <b>ویژگی‌های کلیدی</b>\n"
         "• ✂️ برش زمانی — فقط دقیقه/ثانیه دلخواه را فشرده کنید\n"
+        "• 🎵 استخراج صدا — فقط صدای ویدیو را به m4a دریافت کنید\n"
         "• 🔄 فشرده‌سازی مجدد — پس از هر ارسال، کار آماده اجرای دوباره با تنظیمات جدید است\n"
         "• 🧪 نمونه ۱۰ ثانیه‌ای — کیفیت را قبل از پردازش کامل ببینید\n"
         "• 🌈 تبدیل HDR به SDR — ویدیوهای HDR پذیرفته می‌شوند\n"
         "• 💬 حفظ زیرنویس داخلی\n"
-        "• 📦 حالت جمع‌آوری — چند فایل در یک آرشیو\n"
         "• 💾 پریست‌ها — تنظیمات محبوب خود را ذخیره کنید\n"
+        "• ⭐ پریست‌های آماده — اسلاید، فیلم پرتحرک، اینترنت ضعیف\n"
         "• 🧹 پاک‌سازی دستی — از منوی «آمار ربات» فایل‌های انباشته را حذف کنید\n\n"
+        "━━━━━━━━━━━━━━━\n"
+        "🗜 <b>باز کردن فایل‌های فشرده (پس از دریافت)</b>\n\n"
+        "فایل خروجی با یکی از این پسوندها دریافت می‌شود:\n"
+        "• <code>.zst</code> (Zstandard)\n"
+        "• <code>.br</code> (Brotli)\n"
+        "• <code>.xz</code> (LZMA2)\n\n"
+        "📱 <b>گوشی اندروید</b>\n"
+        "• اپ <b>ZArchiver</b> را از Google Play نصب کنید و فایل را باز کنید.\n"
+        "• یا <b>RAR</b> از Google Play (همه فرمت‌ها را پشتیبانی می‌کند).\n\n"
+        "📱 <b>گوشی iPhone / iPad</b>\n"
+        "• اپ <b>iZip</b> یا <b>Documents by Readdle</b> را از App Store نصب کنید.\n"
+        "• فایل را از تلگرام به اپ بفرستید (Share → Open in iZip).\n\n"
+        "💻 <b>ویندوز</b>\n"
+        "• نرم‌افزار رایگان <b>7-Zip</b> را نصب کنید: 7-zip.org\n"
+        "• روی فایل کلیک راست → Extract Here.\n"
+        "• برای <code>.zst</code> نسخه‌ی 7-Zip 22+ لازم است.\n\n"
+        "💻 <b>macOS</b>\n"
+        "• نرم‌افزار <b>Keka</b> (keka.io) — رایگان و پشتیبانی کامل.\n"
+        "• یا از ترمینال: <code>brew install zstd brotli xz</code>\n"
+        "• سپس: <code>zstd -d file.zst</code> یا <code>brotli -d file.br</code> یا <code>unxz file.xz</code>\n\n"
+        "💻 <b>لینوکس</b>\n"
+        "• نصب: <code>sudo apt install zstd brotli xz-utils</code>\n"
+        "• استخراج: <code>unzstd file.zst</code> | <code>brotli -d file.br</code> | <code>unxz file.xz</code>\n"
+        "━━━━━━━━━━━━━━━\n\n"
         "⚠️ <b>محدودیت‌ها</b>\n"
         f'• مدت مجاز ویدیو: {human_time(MAX_SECONDS)}\n'
         f'• سقف حجم: {human_size(DOWNLOAD_LIMIT)}\n\n'
@@ -741,6 +893,7 @@ def help_text():
         "/start — منوی اصلی\n"
         "/settings — تنظیمات ویدیو\n"
         "/filesettings — تنظیمات فایل\n"
+        "/batch — مجموعه من\n"
         "/queue — صف کارها\n"
         "/stats — آمار ربات\n"
         "/presets — پریست‌های من\n"
@@ -750,24 +903,59 @@ def help_text():
 
 
 # ---------- Receive ----------
-def _create_job(chat, uid, media, name, size, kind):
+def _check_duplicate(uid, file_id=None, source_url=None):
+    """Returns existing job id if a duplicate exists, else None."""
+    active_states = ("downloading", "awaiting", "queued", "running")
+    if source_url:
+        r = one(
+            "SELECT id FROM jobs WHERE uid=? AND source_url=? AND status IN (?,?,?,?)",
+            (uid, source_url) + active_states
+        )
+    elif file_id:
+        r = one(
+            "SELECT id FROM jobs WHERE uid=? AND file_id=? AND status IN (?,?,?,?)",
+            (uid, file_id) + active_states
+        )
+    else:
+        r = None
+    return r["id"] if r else None
+
+
+def _create_job(chat, uid, media, name, size, kind, source_url=None):
     s = get_settings(uid)
     jid = uuid.uuid4().hex[:12]
+
+    dup = _check_duplicate(uid, file_id=media["file_id"] if media else None, source_url=source_url)
+    if dup:
+        send(chat,
+             f'⚠️ <b>فایل تکراری</b>\n\n'
+             f'این فایل قبلاً در مجموعه شما ثبت شده:\n<code>{dup}</code>\n'
+             f'<i>برای ارسال مجدد، ابتدا آن را از مجموعه لغو کنید.</i>')
+        return
+
     with DB_LOCK:
         active = one("SELECT COUNT(*) n FROM jobs WHERE status IN ('downloading','awaiting','queued','running')")["n"]
         personal = one("SELECT COUNT(*) n FROM jobs WHERE uid=? AND status IN ('downloading','awaiting','queued','running')", (uid,))["n"]
         if active >= MAX_ACTIVE_TOTAL or personal >= MAX_ACTIVE_PER_USER:
             send(chat, "❌ صف پر است؛ کمی صبر کنید یا کارهای قبلی را لغو کنید."); return
-        execute("INSERT INTO jobs (id,uid,chat,file_id,name,size,settings,status,message,created,kind) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
-                (jid, uid, chat, media["file_id"], name, size, json.dumps(s), "downloading", None, time.time(), kind))
+        execute(
+            "INSERT INTO jobs (id,uid,chat,file_id,name,size,settings,status,message,created,kind,source_url) "
+            "VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
+            (jid, uid, chat,
+             media["file_id"] if media else "url",
+             name, size, json.dumps(s), "downloading", None, time.time(), kind, source_url)
+        )
     preview = video_summary(s) if kind == "video" else file_summary(s)
+    src_line = f'🔗 {escape_html(source_url[:100])}\n' if source_url else ''
     text = (f'{"🎥" if kind=="video" else "📦"} <b>کار {jid}</b>\n\n'
+            f'{src_line}'
             f'📄 {escape_html(name)}\n💾 {human_size(size)}\n\n{preview}\n\n'
             f'📥 در حال دانلود به سرور...')
     result = safe_send(chat, text, keyboard([[button("❌ لغو", f"cancel:{jid}")]]))
     if result:
         execute("UPDATE jobs SET message=? WHERE id=?", (result["message_id"], jid))
     start_background_download(jid, s["auto"])
+
 
 def receive_video(message, uid, chat):
     media = message.get("video") or message.get("document")
@@ -796,99 +984,25 @@ def receive_file(message, uid, chat):
         send(chat, f"فایل از سقف ({human_size(DOWNLOAD_LIMIT)}) بزرگ‌تر است."); return
     _create_job(chat, uid, media, name, size, "file")
 
-
-# ---------- Collect mode ----------
-def collect_menu(chat, uid, mid=None):
-    state = COLLECT.get(uid)
-    if not state:
-        text = (
-            "📦 <b>حالت جمع‌آوری</b>\n\n"
-            "فایل‌هایی که می‌فرستید جمع می‌شوند و در یک آرشیو فشرده می‌شوند.\n\n"
-            "<i>کاربرد: وقتی چند فایل مرتبط دارید و می‌خواهید همه را با هم در یک آرشیو تحویل بگیرید.</i>"
-        )
-        markup = keyboard([
-            [button("▶️ شروع جمع‌آوری", "collect:start")],
-            [button("🔙 بازگشت", "menu:file_settings")],
-        ])
-    else:
-        files = state["files"]
-        lines = ["📦 <b>حالت جمع‌آوری فعال</b>\n"]
-        total = 0
-        for i, f in enumerate(files, 1):
-            lines.append(f'{i}. {escape_html(f["name"])} — {human_size(f["size"])}')
-            total += f["size"]
-        if not files: lines.append("<i>(هنوز فایلی نفرستاده‌اید)</i>")
-        lines.append(f"\n📊 تعداد: <b>{len(files)}</b> | حجم کل: <b>{human_size(total)}</b>")
-        text = "\n".join(lines)
-        markup = keyboard([
-            [button("🔨 فشرده‌سازی همه", "collect:finish")],
-            [button("🗑 پاک کردن لیست", "collect:clear"), button("❌ انصراف", "collect:exit")],
-        ])
-    if mid: edit(chat, mid, text, markup)
-    else: send(chat, text, markup)
-
-def handle_collect_file(message, uid, chat):
-    media = message.get("document") or message.get("video")
-    if not media:
-        send(chat, "فقط فایل یا ویدیو در حالت جمع‌آوری پذیرفته می‌شود."); return
-    name = clean_name(media.get("file_name") or "file.bin")
-    size = int(media.get("file_size", 0))
-    if size > DOWNLOAD_LIMIT:
-        send(chat, f"فایل از سقف ({human_size(DOWNLOAD_LIMIT)}) بزرگ‌تر است."); return
-    state = COLLECT.setdefault(uid, {"files": [], "message_id": None, "chat": chat})
-    state["files"].append({
-        "file_id": media["file_id"], "name": name, "size": size, "path": None,
-    })
-    collect_menu(chat, uid, state.get("message_id"))
-
-def start_collect_download(uid, chat):
-    state = COLLECT.get(uid)
-    if not state: return
-    workdir = WORK / f"collect_{uid}"
-    workdir.mkdir(parents=True, exist_ok=True)
-    for idx, f in enumerate(state["files"]):
-        if f.get("path") and Path(f["path"]).exists(): continue
-        try:
-            info = api("getFile", {"file_id": f["file_id"]})
-            src = Path(info["file_path"])
-            if not src.exists(): continue
-            dst = workdir / f"{idx:03d}_{clean_name(f['name'])}"
-            shutil.copy2(src, dst)
-            f["path"] = str(dst)
-        except Exception as e:
-            LOG.warning(f"Collect download failed for {f['name']}: {e}")
-
-def _finish_collect(uid, chat, mid):
-    state = COLLECT.get(uid)
-    if not state: return
-    safe_send(chat, f'📥 در حال دانلود {len(state["files"])} فایل...')
-    start_collect_download(uid, chat)
-    workdir = WORK / f"collect_{uid}"
-    files = [f for f in state["files"] if f.get("path") and Path(f["path"]).exists()]
-    if not files:
-        safe_send(chat, "❌ خطا: فایلی موجود نیست."); return
-    tar_path = workdir / f"archive_{uuid.uuid4().hex[:8]}.tar"
+def receive_url(chat, uid, url):
+    if len(url) > 4000:
+        send(chat, "❌ لینک خیلی طولانی است."); return
+    status = safe_send(chat, "🔗 در حال بررسی لینک...")
     try:
-        with tarfile.open(tar_path, "w") as tar:
-            for f in files:
-                tar.add(f["path"], arcname=f["name"])
-    except Exception as e:
-        safe_send(chat, f"❌ خطا در ساخت آرشیو: {e}"); return
-    total_size = tar_path.stat().st_size
-    settings = get_settings(uid)
-    jid = uuid.uuid4().hex[:12]
-    folder = WORK / jid
-    folder.mkdir(parents=True, exist_ok=True)
-    shutil.move(str(tar_path), str(folder / "input"))
-    archive_name = f"archive_{len(files)}_files.tar"
-    execute(
-        "INSERT INTO jobs (id,uid,chat,file_id,name,size,settings,status,message,created,kind) "
-        "VALUES(?,?,?,?,?,?,?,?,?,?,?)",
-        (jid, uid, chat, "local", archive_name, total_size, json.dumps(settings),
-         "queued", mid, time.time(), "file")
-    )
-    COLLECT.pop(uid, None)
-    safe_send(chat, f'✅ آرشیو ساخته شد ({human_size(total_size)}).\n📋 کار <code>{jid}</code> در صف قرار گرفت.')
+        kind, size = detect_url_kind(url)
+    except UserError as e:
+        send(chat, str(e))
+        if status:
+            try: api("deleteMessage", {"chat_id": chat, "message_id": status["message_id"]}, read_timeout=10)
+            except Exception: pass
+        return
+    except Exception:
+        kind, size = "file", 0
+    name = url_to_name(url)
+    if status:
+        try: api("deleteMessage", {"chat_id": chat, "message_id": status["message_id"]}, read_timeout=10)
+        except Exception: pass
+    _create_job(chat, uid, None, name, size, kind, source_url=url)
 
 
 # ---------- Background download ----------
@@ -942,9 +1056,21 @@ def _render_ready(job_id):
                 execute("UPDATE jobs SET media_info=? WHERE id=?", (json.dumps(info), job_id))
         except Exception: pass
 
-    lines = [f'{"🎥" if kind=="video" else "📦"} <b>کار <code>{job_id}</code></b>', ""]
+    # Number of other pending jobs in the user's batch
+    other_pending = one(
+        "SELECT COUNT(*) n FROM jobs WHERE uid=? AND status IN ('downloading','awaiting','queued') AND id != ?",
+        (job["uid"], job_id)
+    )["n"]
+    total_in_batch = other_pending + (1 if job["status"] in ("downloading", "awaiting", "queued") else 0)
+
+    lines = [f'{"🎥" if kind=="video" else "📦"} <b>کار <code>{job_id}</code></b>']
+    if total_in_batch > 1:
+        lines.append(f'📚 <b>{total_in_batch} فایل در مجموعه شما</b>')
+    lines.append("")
     lines.append(f'📄 {escape_html(job["name"])}')
     lines.append(f'💾 {human_size(job["size"])}')
+    if job.get("source_url"):
+        lines.append(f'🔗 منبع: لینک دانلود')
 
     if job.get("output_size") and job.get("finished_at"):
         lines.append("")
@@ -981,27 +1107,33 @@ def _render_ready(job_id):
         lines.append(file_summary(s))
 
     lines.append("")
-    lines.append("<i>می‌توانید تنظیمات را با پریست تغییر دهید، بازه زمانی بگذارید، یا دوباره فشرده کنید.</i>")
+    lines.append("<i>می‌توانید تنظیمات را با پریست تغییر دهید، بازه بگذارید، یا دوباره فشرده کنید.</i>")
 
     status = job["status"]
+    actions = []
+    if total_in_batch > 1:
+        actions.append([button(f"📚 مشاهده مجموعه ({total_in_batch})", "menu:batch")])
+
     if status == "queued":
         lines.append("")
         lines.append("📋 در صف قرار گرفت.")
-        actions = [[button("❌ لغو", f"cancel:{job_id}")]]
+        actions.append([button("❌ لغو", f"cancel:{job_id}")])
     elif status == "running":
         lines.append("")
         lines.append("🔄 در حال پردازش...")
-        actions = [[button("❌ لغو", f"cancel:{job_id}")]]
+        actions.append([button("❌ لغو", f"cancel:{job_id}")])
     elif status == "downloading":
         lines.append("")
         lines.append("📥 در حال دانلود...")
-        actions = [[button("❌ لغو", f"cancel:{job_id}")]]
+        actions.append([button("❌ لغو", f"cancel:{job_id}")])
     else:
-        actions = []
         if kind == "video":
             clip_label = "✂️ تغییر بازه" if (s.get("clip_duration") or 0) > 0 else "✂️ بازه زمانی"
             actions.append([button(clip_label, f"clip:{job_id}")])
-            actions.append([button("🧪 نمونه ۱۰ ثانیه‌ای", f"preview:{job_id}")])
+            actions.append([
+                button("🧪 نمونه ۱۰ ثانیه‌ای", f"preview:{job_id}"),
+                button("🎵 استخراج صدا", f"extract_audio:{job_id}"),
+            ])
         start_label = "🔄 فشرده‌سازی مجدد" if status == "done" else "✅ شروع"
         actions.append([button(start_label, f"go:{job_id}"), button("❌ لغو", f"cancel:{job_id}")])
         actions.append([button("📂 اعمال پریست", f"applypreset:{job_id}")])
@@ -1015,7 +1147,6 @@ def estimate_output_size(info, settings):
     if settings.get("quality") == "quality": base *= 1.5
     elif settings.get("quality") == "small": base *= 0.6
     elif settings.get("quality") == "target":
-        # target_mb is the target for whatever duration is encoded (clip or full)
         return int((settings.get("target_mb", 0) or 0) * 1_000_000)
     h = settings.get("height") or info.get("height", 720)
     if info.get("height", 0) > 0:
@@ -1106,8 +1237,87 @@ def send_preview(job_id):
             except Exception: pass
 
 
+# ---------- Audio extraction ----------
+def extract_audio_only(job_id):
+    job = job_by_id(job_id)
+    if not job: return
+    folder = WORK / job_id
+    source = folder / "input"
+    if not source.exists():
+        safe_send(job["chat"], "❌ فایل ورودی یافت نشد."); return
+
+    s = json.loads(job["settings"])
+    try:
+        info = probe(source)
+    except Exception as e:
+        safe_send(job["chat"], f"❌ خطا در بررسی فایل: {e}"); return
+
+    if info.get("audio_index") is None:
+        safe_send(job["chat"], "❌ این ویدیو فایل صوتی ندارد."); return
+
+    clip_start = float(s.get("clip_start", 0) or 0)
+    clip_dur = float(s.get("clip_duration", 0) or 0)
+    bitrate = s.get("audio", 128) or 128
+    if bitrate == 0: bitrate = 128  # fallback
+
+    audio_path = folder / "audio.m4a"
+    status = safe_send(
+        job["chat"],
+        f'🎵 <b>در حال استخراج صدا</b>\n\n'
+        f'📄 {escape_html(job["name"])}\n'
+        f'🔊 بیت‌ریت: {bitrate} kbps\n'
+        + (f'✂️ از بازه: {human_time(clip_start)} → {human_time(clip_start + clip_dur)}\n' if clip_dur else "")
+    )
+    try:
+        cmd = ["ffmpeg", "-hide_banner", "-nostdin", "-y", "-loglevel", "error"]
+        if clip_start > 0:
+            cmd += ["-ss", f"{clip_start:.3f}"]
+        cmd += ["-i", str(source), "-map", f'0:{info["audio_index"]}', "-vn"]
+        if clip_dur > 0:
+            cmd += ["-t", f"{clip_dur:.3f}"]
+        cmd += ["-c:a", "aac", "-b:a", f"{bitrate}k", "-ac", "2", str(audio_path)]
+
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
+        if result.returncode != 0 or not audio_path.exists():
+            raise UserError("FFmpeg نتوانست صدا را استخراج کند.")
+
+        output_size = audio_path.stat().st_size
+        with audio_path.open("rb") as f:
+            stem = Path(job["name"]).stem or "audio"
+            fname = f"{stem}.m4a"
+            clip_line = (f'✂️ بازه: {human_time(clip_start)} → {human_time(clip_start + clip_dur)}\n'
+                         if clip_dur else "")
+            caption = (f'🎵 <b>صدای استخراج‌شده</b>\n'
+                       f'📄 {escape_html(job["name"])}\n'
+                       f'💾 {human_size(output_size)}\n'
+                       f'🔊 {bitrate} kbps\n'
+                       f'{clip_line}')
+            api("sendAudio", {
+                "chat_id": job["chat"],
+                "caption": caption,
+                "parse_mode": "HTML",
+                "title": stem[:64],
+                "performer": "Audio Extract",
+            }, files={"audio": (fname, f, "audio/mp4")})
+    except subprocess.TimeoutExpired:
+        safe_send(job["chat"], "❌ زمان استخراج صدا به پایان رسید.")
+    except Exception as e:
+        LOG.warning(f"Audio extraction failed for {job_id}: {e}")
+        safe_send(job["chat"], f"❌ خطا: {e}")
+    finally:
+        if audio_path.exists():
+            try: audio_path.unlink()
+            except Exception: pass
+        if status:
+            try:
+                api("deleteMessage", {"chat_id": job["chat"], "message_id": status["message_id"]}, read_timeout=10)
+            except Exception: pass
+
+
 # ---------- Download ----------
 def download(job, target):
+    if job.get("source_url"):
+        return _download_url(job, target, job["source_url"])
     info = api("getFile", {"file_id": job["file_id"]})
     size_hint = int(info.get("file_size", 0))
     if size_hint > DOWNLOAD_LIMIT: raise UserError("فایل از سقف بزرگ‌تر است.")
@@ -1132,15 +1342,17 @@ def download(job, target):
                         if total > DOWNLOAD_LIMIT: raise UserError("فایل بزرگ‌تر از سقف.")
                         fdst.write(chunk)
                         now = time.monotonic()
-                        if now - last >= 2.5 and file_total:
+                        if now - last >= 1.5 and file_total:
                             last = now
                             pct = total / file_total * 100
                             elapsed = now - started
+                            speed = total / elapsed if elapsed > 0 else 0
                             eta = ((file_total - total) * elapsed / total) if total > 0 else 0
                             edit(job["chat"], job["message"],
                                  f'📥 <b>دانلود کار <code>{job["id"]}</code></b>\n'
                                  f'📄 {escape_html(job["name"])}\n'
-                                 f'💾 {human_size(total)} / {human_size(file_total)}\n\n'
+                                 f'💾 {human_size(total)} / {human_size(file_total)}\n'
+                                 f'⚡ {human_size(speed)}/s\n\n'
                                  f'{progress_bar(pct)}\n'
                                  f'⏱ سپری: {human_time(elapsed)} | باقی: {human_time(eta)}',
                                  keyboard([[button("❌ لغو", f"cancel:{job['id']}")]]))
@@ -1162,13 +1374,15 @@ def download(job, target):
                             if total > DOWNLOAD_LIMIT: raise UserError("بزرگ‌تر از سقف.")
                             f.write(chunk)
                             now = time.monotonic()
-                            if now - last >= 2.5 and file_total:
+                            if now - last >= 1.5 and file_total:
                                 last = now
                                 pct = total / file_total * 100
                                 elapsed = now - started
+                                speed = total / elapsed if elapsed > 0 else 0
                                 eta = ((file_total - total) * elapsed / total) if total > 0 else 0
                                 edit(job["chat"], job["message"],
-                                     f'📥 <b>دانلود {job["id"]}</b>\n{human_size(total)} / {human_size(file_total)}\n\n'
+                                     f'📥 <b>دانلود {job["id"]}</b>\n{human_size(total)} / {human_size(file_total)}\n'
+                                     f'⚡ {human_size(speed)}/s\n\n'
                                      f'{progress_bar(pct)}\n⏱ سپری: {human_time(elapsed)} | باقی: {human_time(eta)}',
                                      keyboard([[button("❌ لغو", f"cancel:{job['id']}")]]))
             except requests.RequestException as exc:
@@ -1176,7 +1390,65 @@ def download(job, target):
                 raise UserError(f"دانلود ناموفق ({type(exc).__name__})") from None
         if total == 0: raise UserError("فایل خالی است.")
         part.rename(target)
+        if job["size"] == 0:
+            execute("UPDATE jobs SET size=? WHERE id=?", (total, job["id"]))
         return total
+    finally:
+        if part.exists():
+            try: part.unlink()
+            except Exception: pass
+
+
+def _download_url(job, target, url):
+    part = target.with_name(target.name + ".part")
+    try:
+        with requests.get(url, stream=True, timeout=(30, 300),
+                          headers={"User-Agent": "Mozilla/5.0"},
+                          allow_redirects=True) as r:
+            r.raise_for_status()
+            file_total = int(r.headers.get("Content-Length", 0))
+            if file_total > DOWNLOAD_LIMIT:
+                raise UserError(f"حجم فایل از سقف ({human_size(DOWNLOAD_LIMIT)}) بیشتر است.")
+            last = 0.0; started = time.monotonic(); total = 0
+            with part.open("wb") as f:
+                for chunk in r.iter_content(1024 * 1024):
+                    check_job(job["id"])
+                    if not chunk: continue
+                    total += len(chunk)
+                    if total > DOWNLOAD_LIMIT: raise UserError("حجم از سقف بیشتر شد.")
+                    f.write(chunk)
+                    now = time.monotonic()
+                    if now - last >= 1.5:
+                        last = now
+                        elapsed = now - started
+                        speed = total / elapsed if elapsed > 0 else 0
+                        if file_total > 0:
+                            pct = total / file_total * 100
+                            eta = ((file_total - total) * elapsed / total) if total > 0 else 0
+                            body = (f'📥 <b>دانلود از لینک <code>{job["id"]}</code></b>\n'
+                                    f'📄 {escape_html(job["name"])}\n'
+                                    f'💾 {human_size(total)} / {human_size(file_total)}\n'
+                                    f'⚡ {human_size(speed)}/s\n\n'
+                                    f'{progress_bar(pct)}\n'
+                                    f'⏱ سپری: {human_time(elapsed)} | باقی: {human_time(eta)}')
+                        else:
+                            body = (f'📥 <b>دانلود از لینک <code>{job["id"]}</code></b>\n'
+                                    f'📄 {escape_html(job["name"])}\n'
+                                    f'💾 {human_size(total)} دانلود شده\n'
+                                    f'⚡ {human_size(speed)}/s\n\n'
+                                    f'⏱ سپری: {human_time(elapsed)}')
+                        edit(job["chat"], job["message"], body,
+                             keyboard([[button("❌ لغو", f"cancel:{job['id']}")]]))
+        if total == 0: raise UserError("فایل خالی است.")
+        part.rename(target)
+        if job["size"] == 0:
+            execute("UPDATE jobs SET size=? WHERE id=?", (total, job["id"]))
+        return total
+    except UserError:
+        raise
+    except requests.RequestException as exc:
+        LOG.warning(f"URL DL {job['id']}: {exc}")
+        raise UserError(f"دانلود از لینک ناموفق ({type(exc).__name__})") from None
     finally:
         if part.exists():
             try: part.unlink()
@@ -1250,7 +1522,6 @@ def build_command(source, target, settings, info):
     clip_duration = float(settings.get("clip_duration", 0) or 0)
     preview = bool(settings.get("preview_only"))
 
-    # Determine seek + effective duration
     if preview:
         if clip_duration > 0:
             seek = clip_start
@@ -1481,6 +1752,17 @@ def process_job(job):
         if kind == "video":
             info = probe(source)
             execute("UPDATE jobs SET media_info=? WHERE id=?", (json.dumps(info), jid))
+            # Auto-adjust clip to fit within video duration
+            if settings.get("clip_duration"):
+                start = float(settings.get("clip_start", 0) or 0)
+                dur = float(settings["clip_duration"])
+                if start >= info["duration"]:
+                    settings["clip_start"] = 0
+                    settings["clip_duration"] = min(10, info["duration"])
+                    execute("UPDATE jobs SET settings=? WHERE id=?", (json.dumps(settings), jid))
+                elif start + dur > info["duration"]:
+                    settings["clip_duration"] = info["duration"] - start
+                    execute("UPDATE jobs SET settings=? WHERE id=?", (json.dumps(settings), jid))
             validate_media(info, settings)
             elapsed_enc = encode(job, source, target, settings, info, folder)
             out_info = probe(target)
@@ -1521,10 +1803,8 @@ def process_job(job):
             out_info = None
         check_job(jid)
         upload_result(job, target, settings, out_info, caption, kind)
-        # Mark as done but KEEP the input file so user can re-process.
         execute("UPDATE jobs SET status='done', output_size=?, finished_at=? WHERE id=?",
                 (output_size, time.time(), jid))
-        # Re-render the ready menu so the user can re-run with different settings.
         _render_ready(jid)
     except Cancelled:
         execute("UPDATE jobs SET status='cancelled' WHERE id=?", (jid,))
@@ -1543,7 +1823,6 @@ def process_job(job):
             safe_send(job["chat"], f'❌ کار <code>{jid}</code> ناموفق بود.\n{reason}')
             edit(job["chat"], job["message"], f'❌ کار <code>{jid}</code> ناموفق بود.')
     finally:
-        # Keep the original input file for re-processing; remove transient files only.
         if folder.exists():
             for f in folder.iterdir():
                 if f.name == "input":
@@ -1564,6 +1843,19 @@ def worker():
         if not job:
             STOP.wait(1); continue
         process_job(job)
+
+
+# ---------- Batch operations ----------
+def apply_preset_to_all(uid, settings_subset):
+    jobs = many("SELECT id, settings FROM jobs WHERE uid=? AND status='awaiting'", (uid,))
+    count = 0
+    for j in jobs:
+        s = json.loads(j["settings"])
+        s.update(settings_subset)
+        execute("UPDATE jobs SET settings=? WHERE id=?", (json.dumps(s), j["id"]))
+        _render_ready(j["id"])
+        count += 1
+    return count
 
 
 # ---------- Callbacks ----------
@@ -1590,45 +1882,56 @@ def handle_callback(cb):
         answer(cb["id"]); show_stats(chat, mid)
     elif data == "menu:presets":
         answer(cb["id"]); show_presets(chat, uid, mid)
-    elif data == "menu:collect":
-        answer(cb["id"]); collect_menu(chat, uid, mid)
+    elif data == "menu:batch":
+        answer(cb["id"]); show_batch(chat, uid, mid)
     elif data == "clear_volume":
         answer(cb["id"], "در حال پاک‌سازی...")
         threading.Thread(target=clear_volume_files, args=(chat,), daemon=True).start()
-    elif parts[0] == "collect" and len(parts) == 2:
+    elif parts[0] == "batch" and len(parts) == 2:
         act = parts[1]
-        if act == "start":
-            answer(cb["id"], "حالت جمع‌آوری فعال شد.")
-            COLLECT[uid] = {"files": [], "message_id": mid, "chat": chat}
-            collect_menu(chat, uid, mid)
-        elif act == "exit":
+        if act == "preset":
             answer(cb["id"])
-            st = COLLECT.pop(uid, None)
-            if st:
-                for f in st["files"]:
-                    if f.get("path"):
-                        try: Path(f["path"]).unlink()
-                        except Exception: pass
-            file_settings_menu(chat, uid, mid)
-        elif act == "clear":
-            st = COLLECT.get(uid)
-            if st:
-                for f in st["files"]:
-                    if f.get("path"):
-                        try: Path(f["path"]).unlink()
-                        except Exception: pass
-                st["files"] = []
-            answer(cb["id"], "لیست پاک شد.")
-            collect_menu(chat, uid, mid)
-        elif act == "finish":
-            st = COLLECT.get(uid)
-            if not st or not st["files"]:
-                answer(cb["id"], "لیست خالی است."); return
-            answer(cb["id"], "در حال ساخت آرشیو...")
-            threading.Thread(target=_finish_collect, args=(uid, chat, mid), daemon=True).start()
+            rows = []
+            for key, sp in SYSTEM_PRESETS.items():
+                rows.append([button(f'⭐ {sp["title"]}', f'batchpsys:{key}')])
+            for pr in list_presets(uid, "video"):
+                rows.append([button(f'📂 {pr["name"]}', f'batchp:{pr["id"]}')])
+            rows.append([button("❌ انصراف", "menu:batch")])
+            edit(chat, mid,
+                 "📂 <b>پریست را برای اعمال به همه انتخاب کنید:</b>\n\n"
+                 "<i>تنظیمات این پریست روی همه‌ی فایل‌های در انتظار اعمال می‌شود. بازه‌های زمانی حفظ می‌شوند.</i>",
+                 keyboard(rows))
+        elif act == "start":
+            count = execute(
+                "UPDATE jobs SET status='queued', output_size=NULL, finished_at=NULL "
+                "WHERE uid=? AND status='awaiting'", (uid,))
+            answer(cb["id"], f'✅ {count} کار در صف قرار گرفت.')
+            show_batch(chat, uid, mid)
+        elif act == "cancel":
+            count = execute(
+                "UPDATE jobs SET status='cancelled' "
+                "WHERE uid=? AND status IN ('downloading','awaiting','queued')", (uid,))
+            answer(cb["id"], f'⛔ {count} کار لغو شد.')
+            show_batch(chat, uid, mid)
+    elif parts[0] == "batchpsys" and len(parts) == 2:
+        sp = SYSTEM_PRESETS.get(parts[1])
+        if not sp: answer(cb["id"], "یافت نشد."); return
+        count = apply_preset_to_all(uid, sp["settings"])
+        answer(cb["id"], f'✅ پریست «{sp["title"]}» به {count} فایل اعمال شد.')
+        show_batch(chat, uid, mid)
+    elif parts[0] == "batchp" and len(parts) == 2:
+        pr = get_preset(uid, int(parts[1]))
+        if not pr: answer(cb["id"], "یافت نشد."); return
+        subset = json.loads(pr["settings"])
+        count = apply_preset_to_all(uid, subset)
+        answer(cb["id"], f'✅ پریست «{pr["name"]}» به {count} فایل اعمال شد.')
+        show_batch(chat, uid, mid)
     elif parts[0] == "preview" and len(parts) == 2:
-        answer(cb["id"], "در حال ساخت نمونه با تنظیمات فعلی...")
+        answer(cb["id"], "در حال ساخت نمونه...")
         threading.Thread(target=send_preview, args=(parts[1],), daemon=True).start()
+    elif parts[0] == "extract_audio" and len(parts) == 2:
+        answer(cb["id"], "در حال استخراج صدا...")
+        threading.Thread(target=extract_audio_only, args=(parts[1],), daemon=True).start()
     elif parts[0] == "clip" and len(parts) == 2:
         job = job_by_id(parts[1])
         if not job or job["uid"] != uid:
@@ -1693,10 +1996,21 @@ def handle_callback(cb):
         if not job or job["uid"] != uid: answer(cb["id"]); return
         answer(cb["id"])
         rows = []
+        for key, sp in SYSTEM_PRESETS.items():
+            if sp["kind"] == "video":
+                rows.append([button(f'⭐ {sp["title"]}', f"applypsys:{parts[1]}:{key}")])
         for pr in list_presets(uid, "video"):
             rows.append([button(f'📂 {pr["name"]}', f"applyp:{parts[1]}:{pr['id']}")])
         rows.append([button("❌ انصراف", f"back:{parts[1]}")])
         edit(chat, mid, "💾 <b>پریست را انتخاب کنید:</b>\n\n<i>تنظیمات این پریست روی کار اعمال می‌شود (بازه زمانی حفظ می‌شود).</i>", keyboard(rows))
+    elif parts[0] == "applypsys" and len(parts) == 3:
+        job = job_by_id(parts[1])
+        if not job or job["uid"] != uid: answer(cb["id"]); return
+        sp = SYSTEM_PRESETS.get(parts[2])
+        if not sp: answer(cb["id"], "یافت نشد."); return
+        s = json.loads(job["settings"]); s.update(sp["settings"])
+        execute("UPDATE jobs SET settings=? WHERE id=?", (json.dumps(s), job["id"]))
+        answer(cb["id"], f'پریست «{sp["title"]}» اعمال شد.'); _render_ready(job["id"])
     elif parts[0] == "applyp" and len(parts) == 3:
         job = job_by_id(parts[1])
         if not job or job["uid"] != uid: answer(cb["id"]); return
@@ -1719,6 +2033,13 @@ def handle_callback(cb):
             answer(cb["id"], f'پریست «{pr["name"]}» اعمال شد.')
             if pr["kind"] == "video": settings_menu(chat, uid, mid)
             else: file_settings_menu(chat, uid, mid)
+        elif parts[1] == "loadsys" and len(parts) == 3:
+            sp = SYSTEM_PRESETS.get(parts[2])
+            if not sp: answer(cb["id"], "یافت نشد."); return
+            s = get_settings(uid); s.update(sp["settings"]); save_settings(uid, s)
+            answer(cb["id"], f'پریست «{sp["title"]}» اعمال شد.')
+            if sp["kind"] == "video": settings_menu(chat, uid, mid)
+            else: file_settings_menu(chat, uid, mid)
         elif parts[1] == "del" and len(parts) == 3:
             pr = get_preset(uid, int(parts[2]))
             if not pr: answer(cb["id"]); return
@@ -1737,7 +2058,7 @@ def handle_callback(cb):
         if not job or job["uid"] != uid: answer(cb["id"], "یافت نشد."); return
         if parts[0] == "go":
             changed = execute(
-                "UPDATE jobs SET status='queued', error_msg=NULL WHERE id=? "
+                "UPDATE jobs SET status='queued', error_msg=NULL, output_size=NULL, finished_at=NULL WHERE id=? "
                 "AND status IN ('awaiting','done','failed','cancelled')",
                 (job["id"],))
             answer(cb["id"], "✅ در صف قرار گرفت." if changed else "امکان‌پذیر نیست.")
@@ -1764,7 +2085,6 @@ def handle_message(message):
     if not authorized(uid, claim=command == "/start"):
         send(chat, "این ربات خصوصی است."); return
 
-    # Any command aborts any pending input session
     if command:
         SESSION.pop(uid, None)
 
@@ -1829,11 +2149,9 @@ def handle_message(message):
             _render_ready(jid)
         return
 
-    if uid in COLLECT and (message.get("document") or message.get("video")):
-        handle_collect_file(message, uid, chat); return
-
     if command == "/settings": settings_menu(chat, uid)
     elif command == "/filesettings": file_settings_menu(chat, uid)
+    elif command == "/batch": show_batch(chat, uid)
     elif command in ("/queue", "/status"): show_queue(chat, uid)
     elif command == "/stats": show_stats(chat)
     elif command == "/presets": show_presets(chat, uid)
@@ -1854,6 +2172,8 @@ def handle_message(message):
         exts = (".mp4", ".mkv", ".mov", ".webm", ".avi", ".m4v", ".ts")
         if mime.startswith("video/") or name.endswith(exts): receive_video(message, uid, chat)
         else: receive_file(message, uid, chat)
+    elif is_url(text):
+        receive_url(chat, uid, text)
     elif message.get("audio"):
         send(chat, "🎵 این یک فایل صوتی است.\nبرای فشرده‌سازی، ابتدا آن را به‌عنوان Document بفرستید.")
     elif message.get("voice"):
@@ -1917,7 +2237,6 @@ def main():
     lf = (DATA / "instance.lock").open("a")
     try: fcntl.flock(lf, fcntl.LOCK_EX | fcntl.LOCK_NB)
     except BlockingIOError: raise SystemExit("Another instance running.")
-    # Only clean up loose files at the root; keep per-job work dirs so re-processing works.
     for p in WORK.iterdir():
         if p.is_file():
             try: p.unlink()
@@ -1932,6 +2251,7 @@ def main():
             {"command": "start", "description": "منوی اصلی"},
             {"command": "settings", "description": "تنظیمات ویدیو"},
             {"command": "filesettings", "description": "تنظیمات فایل"},
+            {"command": "batch", "description": "مجموعه من"},
             {"command": "queue", "description": "صف کارها"},
             {"command": "stats", "description": "آمار ربات"},
             {"command": "presets", "description": "پریست‌ها"},
